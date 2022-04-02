@@ -68,14 +68,20 @@ class BPE(object):
 
         self.cache = {}
 
-    def process_lines(self, filename, outfile, dropout=0, num_workers=1):
+        # BPE-generalize
+        self.subword_counter = {}
+        if vocab:
+            for subword in vocab:
+                self.subword_counter[subword] = 0
+
+    def process_lines(self, filename, outfile, dropout=0, num_workers=1, distribution=1):
 
         if sys.version_info < (3, 0):
             print("Parallel mode is only supported in Python3.")
             sys.exit(1)
 
         if num_workers == 1:
-            _process_lines(self, filename, outfile, dropout, 0, 0)
+            _process_lines(self, filename, outfile, dropout, 0, 0, distribution)
         elif num_workers > 1:
             with open(filename, encoding="utf-8") as f:
                 size = os.fstat(f.fileno()).st_size
@@ -99,7 +105,8 @@ class BPE(object):
                 tmp = tempfile.NamedTemporaryFile(delete=False)
                 tmp.close()
                 res_files.append(tmp)
-                pool.apply_async(_process_lines, (self, filename, tmp.name, dropout, offsets[i], offsets[i + 1]))
+                pool.apply_async(_process_lines, (self, filename, tmp.name, dropout, offsets[i], offsets[i + 1],
+                                                  distribution))
             pool.close()
             pool.join()
             for i in range(num_workers):
@@ -110,7 +117,7 @@ class BPE(object):
         else:
             raise ValueError('`num_workers` is expected to be a positive number, but got {}.'.format(num_workers))
 
-    def process_line(self, line, dropout=0):
+    def process_line(self, line, dropout=0, distribution=1):
         """segment line, dealing with leading and trailing whitespace"""
 
         out = ""
@@ -119,7 +126,7 @@ class BPE(object):
         if leading_whitespace:
             out += line[:leading_whitespace]
 
-        out += self.segment(line, dropout)
+        out += self.segment(line, dropout, distribution)
 
         trailing_whitespace = len(line)-len(line.rstrip('\r\n '))
         if trailing_whitespace and trailing_whitespace != len(line):
@@ -127,12 +134,12 @@ class BPE(object):
 
         return out
 
-    def segment(self, sentence, dropout=0):
+    def segment(self, sentence, dropout=0, distribution=1):
         """segment single sentence (whitespace-tokenized string) with BPE encoding"""
-        segments = self.segment_tokens(sentence.strip('\r\n ').split(' '), dropout)
+        segments = self.segment_tokens(sentence.strip('\r\n ').split(' '), dropout, distribution)
         return ' '.join(segments)
 
-    def segment_tokens(self, tokens, dropout=0):
+    def segment_tokens(self, tokens, dropout=0, distribution=1):
         """segment a sequence of tokens with BPE encoding"""
         output = []
         for word in tokens:
@@ -148,11 +155,18 @@ class BPE(object):
                                           self.version,
                                           self.cache,
                                           self.glossaries_regex,
-                                          dropout)]
+                                          dropout,
+                                          distribution,
+                                          self.subword_counter)]
 
             for item in new_word[:-1]:
                 output.append(item + self.separator)
             output.append(new_word[-1])
+
+        # BPE-generalize
+        if distribution < 1 and self.subword_counter:
+            for subword in output:
+                self.subword_counter[subword] += 1
 
         return output
 
@@ -163,7 +177,7 @@ class BPE(object):
                                  for out_segments in isolate_glossary(segment, gloss)]
         return word_segments
 
-def _process_lines(bpe, filename, outfile, dropout, begin, end):
+def _process_lines(bpe, filename, outfile, dropout, begin, end, distribution):
     if isinstance(outfile, str):
         fo = open(outfile, "w", encoding="utf-8")
     else:
@@ -176,7 +190,7 @@ def _process_lines(bpe, filename, outfile, dropout, begin, end):
             assert 0 <= pos < 1e20, "Bad new line separator, e.g. '\\r'"
             if end > 0 and pos > end:
                 break
-            fo.write(bpe.process_line(line, dropout))
+            fo.write(bpe.process_line(line, dropout, distribution))
             line = f.readline()
     if isinstance(outfile, str):
         fo.close()
@@ -237,10 +251,15 @@ def create_parser(subparsers=None):
     parser.add_argument(
         '--num-workers', type=int, default=1,
         help="Number of processors to process texts, only supported in Python3. If -1, set `multiprocessing.cpu_count()`. (default: %(default)s)")
+    parser.add_argument(
+        '--distribution', type=float, default=1,
+        metavar="D",
+        help="Evenly distributes segmented training data with acceptable distribution D (Binaday & Ballera, 2022). Use this on training data only.")
 
     return parser
 
-def encode(orig, bpe_codes, bpe_codes_reverse, vocab, separator, version, cache, glossaries_regex=None, dropout=0):
+def encode(orig, bpe_codes, bpe_codes_reverse, vocab, separator, version, cache, glossaries_regex=None, dropout=0,
+           distribution=1, subword_counter={}):
     """Encode word based on list of BPE merge operations, which are applied consecutively
     """
 
@@ -296,7 +315,14 @@ def encode(orig, bpe_codes, bpe_codes_reverse, vocab, separator, version, cache,
 
     word = tuple(word)
     if vocab:
-        word = check_vocab_and_split(word, bpe_codes_reverse, vocab, separator)
+        # BPE-generalize
+        if distribution < 1 and subword_counter:
+            total_count = sum(subword_counter.values())
+            filtered_vocab = [subword for subword, count in subword_counter.items() if count / total_count <= distribution]
+        else:
+            filtered_vocab = vocab
+
+        word = check_vocab_and_split(word, bpe_codes_reverse, filtered_vocab, separator)
 
     cache[orig] = word
     return word
@@ -443,6 +469,6 @@ if __name__ == '__main__':
         if args.num_workers > 1:
             warnings.warn("In parallel mode, the input cannot be STDIN. Using 1 processor instead.")
         for line in args.input:
-            args.output.write(bpe.process_line(line, args.dropout))
+            args.output.write(bpe.process_line(line, args.dropout, args.distribution))
     else:
-        bpe.process_lines(args.input.name, args.output, args.dropout, args.num_workers)
+        bpe.process_lines(args.input.name, args.output, args.dropout, args.num_workers, args.distribution)
